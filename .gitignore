@@ -1,0 +1,21 @@
+# Build artefacts
+bin/
+*.exe
+*.exe~
+.devin/
+# Test / coverage output
+*.out
+coverage.txt
+coverage.html
+
+# Editor / OS noise
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local-only configuration
+.env
+.env.local
+.devin/config.local.json

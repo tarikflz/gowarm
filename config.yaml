@@ -1,0 +1,195 @@
+# --------------------------------------------------------------------------
+# gowarm config — generic sitemap cache warmer.
+#
+# gowarm fetches `sitemap_url`, optionally filters URLs via `url_filter`,
+# then for every remaining URL it generates the cartesian product of all
+# `axes` and issues one HTTP request per combination. Each axis projects its
+# value onto a cookie (cookie_name) and/or a header (header_name).
+#
+# Any string in this file may reference an environment variable with ${VAR}.
+# Empty / unset variables expand to "".
+#
+# The defaults below show a 4-region × 2-language scenario where the language
+# is tied to the URL path. Replace `axes` to adapt to any other site.
+# --------------------------------------------------------------------------
+
+sitemap_url: "https://example.com/sitemap.xml"
+
+# Tune to your origin's tolerance.
+worker_count: 50
+
+# GET produces a real cache fill on most CDN+origin combos. HEAD is faster but
+# many caches won't populate from a HEAD response.
+method: GET
+
+user_agent: "gowarm/1.0 (+sitemap-cache-warmer; contact ops@example.com)"
+
+http:
+  timeout: 20s
+  max_idle_conns: 200
+  max_idle_conns_per_host: 100
+  idle_conn_timeout: 90s
+  disable_compression: false
+  # Rate limiting + per-host concurrency. All four are optional and disabled
+  # by default (a value of 0 means "no limit"). When rate_limit_rps > 0 and
+  # burst is unset, burst defaults to rate_limit_rps so a 1-second burst is
+  # tolerated.
+  rate_limit_rps: 0          # global token-bucket rate (req/sec)
+  burst: 0                   # bucket capacity (defaults to rate_limit_rps)
+  max_conns_per_host: 0      # in-flight cap per host (semaphore)
+  # Adaptive slowdown: on 429/503 the effective rate is multiplied by
+  # adaptive_slowdown_factor for adaptive_slowdown_duration before recovering.
+  adaptive_slowdown: false
+  adaptive_slowdown_factor: 0.5
+  adaptive_slowdown_duration: 30s
+
+retry:
+  max_attempts: 3
+  base_delay: 200ms
+  max_delay: 5s
+  jitter: 200ms
+  factor: 2.0
+
+# Optional: gate which sitemap URLs are warmed at all. All four lists are
+# optional and combine like this:
+#   - excludes always win;
+#   - if no includes are configured, every non-excluded URL passes;
+#   - otherwise a URL must match at least one include.
+#
+# url_filter:
+#   include_substrings: ["/en/", "/fr/"]
+#   exclude_substrings: ["/admin/", "/preview/"]
+#   include_regex: ["/(en|fr)$"]
+#   exclude_regex: ["\\.(json|xml)$"]
+
+# Each axis is one dimension of the warming cartesian product. Per request,
+# gowarm picks one value from each axis and projects it onto:
+#   - cookie_name (sent as a Cookie header) and/or
+#   - header_name (sent as a regular HTTP header).
+#
+# `transform` may be `upper`, `lower`, or `none` (default). It is applied to
+# each value before it is sent.
+#
+# A value can be either a plain string (shorthand) or an object with optional
+# `when_url_contains` / `when_url_matches` filters that bind the value to a
+# subset of URLs (substring match and regex respectively). If a URL has zero
+# applicable values for ANY axis, that URL is skipped.
+axes:
+  - name: region
+    cookie_name: region        # site's region cookie
+    transform: upper           # server expects ON/MB/QC/AB, not on/mb/qc/ab
+    values:
+      - on   # Ontario
+      - mb   # Manitoba
+      - qc   # Quebec
+      - ab   # Alberta
+
+  - name: language
+    cookie_name: lang          # site's language cookie
+    values:
+      - value: en
+        when_url_matches: ["/en(/|$)"]
+      - value: fr
+        when_url_matches: ["/fr(/|$)"]
+
+# Optional headers applied to every request. Per-job headers from the axis
+# system override defaults declared here.
+global_headers:
+  X-Warm-Source: "gowarm"
+
+# Cookies applied on every request unless an axis sets one with the same name.
+global_cookies: []
+
+# Follow nested <sitemapindex> references (recommended).
+follow_index: true
+
+# Exit non-zero if any job ultimately fails. Default false so transient
+# failures don't break a CI cron.
+stop_on_error: false
+
+log_level: info
+
+# Optional artefacts written to disk. All three paths are independent and
+# opt-in — leave blank (or omit entirely) to disable. The matching CLI flags
+# (-log-file / -per-job-file / -summary-file) override these values.
+#
+#   log_file     — tee the same slog lines that go to stdout to this file.
+#   per_job_file — JSONL, one object per warm job (URL, status, normalised
+#                  cache_state + cache_state_raw + cache_header, duration,
+#                  axis tags, err / cancelled).
+#   summary_file — JSON document written once at the end with aggregate
+#                  counters (cache_hits / cache_misses / cache_bypass /
+#                  unknown_cache_state / hit_ratio) and the list of real
+#                  (non-cancelled) failures.
+report:
+  log_file: ""
+  per_job_file: ""
+  summary_file: ""
+
+# Cache verification: how to classify a response into hit / miss / bypass /
+# unknown. Rules are evaluated in order, first match wins. Each rule pairs a
+# response header with a match strategy (one of match_equals / match_contains
+# / match_regex; or omit all three to match on header presence alone).
+#
+# When rules is empty, gowarm uses a built-in default that recognises
+# CF-Cache-Status, X-Drupal-(Dynamic-)Cache, X-Cache, X-Cache-Status, and Age.
+# That is enough for Cloudflare, Drupal, Fastly, Varnish, and nginx-cache out
+# of the box.
+#
+# Example overriding the default with a custom CDN:
+# cache_detection:
+#   rules:
+#     - header: X-Foo-Cache
+#       match_equals: HIT
+#       state: hit
+#     - header: X-Foo-Cache
+#       match_regex: "^MISS-\\d+$"
+#       state: miss
+#     - header: Age
+#       state: hit            # presence is enough
+cache_detection:
+  rules: []
+
+# Cartesian-explosion guards. Both limits are advisory — when exceeded,
+# gowarm aborts before any traffic is sent. Pass `-force` on the CLI to
+# bypass them.
+#
+#   max_jobs                — total cap across the entire run.
+#   max_combinations_per_url — per-URL cap. URLs whose applicable cartesian
+#                              exceeds this value are skipped.
+limits:
+  max_jobs: 0
+  max_combinations_per_url: 0
+
+# Sampling lets you trim the URL list before the cartesian product is
+# generated. Percent and first_n are mutually exclusive; percent wins.
+# Random=true switches to a seeded random sample (set seed for reproducible
+# CI runs); the default is a deterministic stride that picks every Nth URL
+# so re-runs warm the same set without a seed.
+sampling:
+  percent: 0      # 0 or 100 disables sampling
+  first_n: 0      # 0 disables; >0 keeps the first N URLs
+  random: false
+  seed: 0
+
+# priority_urls promotes URLs matching one of its filters to the front of
+# the queue so hot paths warm up first. Set include_first: true to enable.
+priority_urls:
+  include_first: false
+  include_substrings: []
+  include_regex: []
+
+# --------------------------------------------------------------------------
+# Generic example — currency × locale on a different site (commented out):
+#
+# axes:
+#   - name: currency
+#     cookie_name: currency
+#     values: [usd, eur, gbp]
+#   - name: locale
+#     header_name: Accept-Language
+#     values: [en-US, fr-FR, de-DE]
+#
+# That config produces 3×3 = 9 requests per URL, each with a cookie + header
+# combination matching the chosen currency/locale.
+# --------------------------------------------------------------------------
